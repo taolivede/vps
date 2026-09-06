@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-#  VPS 初始化脚本 v1.0
+#  VPS 初始化脚本 v3.6（最终版）
 #  仅适用于全新安装的 Ubuntu / Debian 裸机。
 #  运行前请保持另一个 root SSH 会话，以防万一。
 #
@@ -26,7 +26,7 @@ ALLOW_NON_FRESH="${ALLOW_NON_FRESH:-0}"
 
 # ==================== 辅助函数 ====================
 log()  { echo -e "\033[1;32m[+] $*\033[0m"; }
-warn() { echo -e "\033[1;33m[!] $*\033[0m"; }
+warn() { echo -e "\033[1;33m[!] $*\033[0m" >&2; }  # 走 stderr：函数输出可能被命令替换捕获，不能污染 stdout
 err()  { echo -e "\033[1;31m[-] $*\033[0m" >&2; exit 1; }
 trap 'echo -e "\033[1;31m[-] 脚本在第 $LINENO 行失败，请检查上方输出后重跑。\033[0m" >&2' ERR
 
@@ -45,6 +45,14 @@ source /etc/os-release
 
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a   # 避免 needrestart 弹交互菜单
+
+# /run 是 tmpfs，每次开机重建；/run/sshd 由 ssh.service 的 RuntimeDirectory=
+# 或 openssh 包的 tmpfiles.d 在开机/服务启动时创建。若 sshd 此刻并非由 systemd
+# 单元维持运行（控制台操作、LXC 容器、openssh 升级中间态等），该目录会缺失，
+# 导致 sshd -t/-T 直接报 "Missing privilege separation directory: /run/sshd"。
+# 提前创建（与 Debian 官方 postinst 做法一致），保证后续所有 sshd 检测可靠。
+mkdir -p /run/sshd
+chmod 0755 /run/sshd
 
 # ---- 裸机检测 ----
 WARN_COUNT=0
@@ -73,8 +81,14 @@ fi
 
 # ==================== SSH 端口检测（不修改 sshd，仅用于 UFW/提示） ====================
 get_ssh_port() {
-  local port
-  port="$("$SSHD_BIN" -T 2>/dev/null | awk '/^port /{print $2; exit}')" || true
+  local out port
+  # 失败时显式告警，不再静默回退（warn 已走 stderr，不会污染本函数的 stdout 捕获）
+  if ! out="$("$SSHD_BIN" -T 2>&1)"; then
+    warn "sshd -T 读取失败: ${out}——端口检测回退为 22"
+    echo "22"
+    return 0
+  fi
+  port="$(awk '/^port /{print $2; exit}' <<<"$out")"
   if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -gt 0 ]; then
     echo "$port"
   else
@@ -173,7 +187,7 @@ OPTS
   # 00- 前缀保证本文件按字典序最先读取，先于 50-cloud-init.conf 生效。
   # 切勿改成 99- 等更大序号，否则加固会被 cloud-init 静默覆盖！
   {
-    echo "# 由 VPS 初始化脚本 v3.5 生成。"
+    echo "# 由 VPS 初始化脚本 v3.6 生成。"
     echo "# sshd 首次出现的值生效；00- 前缀保证先于 50-cloud-init.conf 读取。"
     for opt in "${SSH_OPTS[@]}"; do
       echo "$opt"
@@ -181,7 +195,8 @@ OPTS
   } > /etc/ssh/sshd_config.d/00-hardening.conf
   chmod 644 /etc/ssh/sshd_config.d/00-hardening.conf
 
-  if "$SSHD_BIN" -t; then
+  # 校验失败时输出 sshd 的真实报错，而不是笼统指向配置文件
+  if SSHD_T_OUT="$("$SSHD_BIN" -t 2>&1)"; then
     if ! systemctl restart sshd 2>/dev/null && ! systemctl restart ssh 2>/dev/null; then
       err "SSH 重启失败（此时 UFW 尚未启用，当前会话不受影响）。请手动排查后重跑。"
     fi
@@ -195,7 +210,7 @@ OPTS
       warn "危险：PasswordAuthentication 实际仍为 yes（被其他配置覆盖），请立即检查 /etc/ssh/sshd_config.d/ 与主配置！"
     fi
   else
-    err "sshd -t 校验失败，未重启 SSH。请检查 /etc/ssh/sshd_config.d/00-hardening.conf。"
+    err "sshd -t 校验失败: ${SSHD_T_OUT:-未知错误}。请检查 /etc/ssh/sshd_config.d/00-hardening.conf 与 sshd 主配置。"
   fi
 else
   log "未提供 SSH_PUBLIC_KEY，跳过用户创建与 SSH 加固（避免被锁在系统外）。"
@@ -461,7 +476,7 @@ if [ "$PORTAINER_BIND" != "127.0.0.1" ]; then
   log "安装 DOCKER-USER 端口白名单（systemd 持久化）..."
   cat > /usr/local/sbin/docker-user-guard.sh <<'GUARD_EOF'
 #!/usr/bin/env bash
-# 由 VPS 初始化脚本 v3.5 生成：限制 Docker 发布端口 9443 的来源。
+# 由 VPS 初始化脚本 v3.6 生成：限制 Docker 发布端口 9443 的来源。
 # 更换白名单时：iptables -F DOCKER-USER 后重跑本脚本，或重启 docker-user-guard 服务。
 set -euo pipefail
 ALLOW_IP="${1:-}"
