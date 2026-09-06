@@ -2,12 +2,14 @@
 set -euo pipefail
 
 # =============================================================================
-#  VPS 初始化脚本 v3.6（最终版）
+#  VPS 初始化脚本 v3.7（最终版）
 #  仅适用于全新安装的 Ubuntu / Debian 裸机。
 #  运行前请保持另一个 root SSH 会话，以防万一。
 #
 #  用法：
 #    SSH_PUBLIC_KEY="ssh-ed25519 AAAA..." bash vps_init.sh
+#  国内等 docker.io 被阻断的网络，请同时配置镜像加速：
+#    REGISTRY_MIRRORS="https://docker.m.daocloud.io" bash vps_init.sh
 #  无人值守时可直接传 PORTAINER_PASSWORD=...（会留在 shell 历史）；
 #  交互终端会询问密码（回车则自动生成）。
 # =============================================================================
@@ -23,6 +25,7 @@ SWAP_SIZE_MB="${SWAP_SIZE_MB:-2048}"
 TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
 ENABLE_IPV6="${ENABLE_IPV6:-true}"
 ALLOW_NON_FRESH="${ALLOW_NON_FRESH:-0}"
+REGISTRY_MIRRORS="${REGISTRY_MIRRORS:-}"             # Docker Hub 镜像加速，空格分隔多个；国内网络通常必需
 
 # ==================== 辅助函数 ====================
 log()  { echo -e "\033[1;32m[+] $*\033[0m"; }
@@ -187,7 +190,7 @@ OPTS
   # 00- 前缀保证本文件按字典序最先读取，先于 50-cloud-init.conf 生效。
   # 切勿改成 99- 等更大序号，否则加固会被 cloud-init 静默覆盖！
   {
-    echo "# 由 VPS 初始化脚本 v3.6 生成。"
+    echo "# 由 VPS 初始化脚本 v3.7 生成。"
     echo "# sshd 首次出现的值生效；00- 前缀保证先于 50-cloud-init.conf 读取。"
     for opt in "${SSH_OPTS[@]}"; do
       echo "$opt"
@@ -271,40 +274,57 @@ if [ -n "$SSH_PUBLIC_KEY" ] && id "$NEW_USER" &>/dev/null; then
   usermod -aG docker "$NEW_USER" || true
 fi
 
+# 构建 registry-mirrors JSON 数组（始终写出该键，空数组合法）
+MIRROR_ARR=""
+for m in $REGISTRY_MIRRORS; do
+  MIRROR_ARR+="\"${m}\", "
+done
+MIRROR_ARR="${MIRROR_ARR%, }"
+
 mkdir -p /etc/docker
 if [ "$ENABLE_IPV6" = "true" ]; then
   # ipv6/ip6tables 自 Docker 27 起为稳定特性，无需 experimental
-  cat > /etc/docker/daemon.json <<'EOF'
+  cat > /etc/docker/daemon.json <<EOF
 {
   "log-driver": "json-file",
   "log-opts": { "max-size": "20m", "max-file": "3" },
+  "registry-mirrors": [${MIRROR_ARR}],
   "ipv6": true,
   "ip6tables": true,
   "fixed-cidr-v6": "fd00:dead:beef:c0::/80"
 }
 EOF
 else
-  cat > /etc/docker/daemon.json <<'EOF'
+  cat > /etc/docker/daemon.json <<EOF
 {
   "log-driver": "json-file",
-  "log-opts": { "max-size": "20m", "max-file": "3" }
+  "log-opts": { "max-size": "20m", "max-file": "3" },
+  "registry-mirrors": [${MIRROR_ARR}]
 }
 EOF
 fi
 systemctl restart docker
 
+if [ -n "$REGISTRY_MIRRORS" ]; then
+  log "已配置 Docker Hub 镜像加速: ${REGISTRY_MIRRORS}"
+else
+  warn "未配置 REGISTRY_MIRRORS。若本机网络无法直连 docker.io（国内常见），Portainer 镜像将拉取失败。"
+fi
+
 # ==================== 部署 Portainer ====================
 log "部署 Portainer CE..."
 mkdir -p /opt/portainer
 
-# 幂等：仅当数据卷为新建时才初始化管理员密码
-VOL_NEW=1
-if docker volume inspect portainer_data &>/dev/null; then
-  VOL_NEW=0
-  warn "检测到已存在的 portainer_data 卷，跳过管理员密码初始化（沿用首次部署的密码）。"
+# 幂等：数据卷存在且密码 hash 文件在 → 视为已部署，沿用旧密码；否则重新初始化。
+# （卷存在但 hash 缺失时重新生成也无害：Portainer 对已初始化的管理员会忽略 --admin-password-file；
+#   反过来，"卷已建但容器从未启动过"的失败重试也能重新拿到密码初始化机会）
+PORTAINER_FRESH=1
+if docker volume inspect portainer_data &>/dev/null && [ -f /root/portainer_admin_password_hash ]; then
+  PORTAINER_FRESH=0
+  warn "检测到已部署的 Portainer 数据卷，跳过管理员密码初始化（沿用首次部署的密码）。"
 fi
 
-if [ "$VOL_NEW" = "1" ]; then
+if [ "$PORTAINER_FRESH" = "1" ]; then
   if [ -z "$PORTAINER_PASSWORD" ] && [ -t 0 ]; then
     read -r -s -p "设置 Portainer admin 密码（输入不回显，直接回车则自动生成）: " PORTAINER_PASSWORD || true
     echo ""
@@ -322,7 +342,7 @@ fi
 # 注意：卷已存在时 --admin-password-file 不会生效（安装被跳过），
 # 且若密码 hash 文件已被删除，挂载不存在的 bind 路径会让 Docker 创建同名目录导致容器异常。
 # 因此两种情况使用不同的 compose 文件。
-if [ "$VOL_NEW" = "1" ]; then
+if [ "$PORTAINER_FRESH" = "1" ]; then
   cat > /opt/portainer/docker-compose.yml <<COMPOSE_EOF
 services:
   portainer:
@@ -364,23 +384,49 @@ volumes:
 COMPOSE_EOF
 fi
 
-docker rm -f portainer >/dev/null 2>&1 || true
-docker compose -f /opt/portainer/docker-compose.yml up -d
-
-log "等待 Portainer 就绪（最多 30 秒）..."
-PORTAINER_OK=0
-for _ in {1..10}; do
-  sleep 3
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^portainer$' \
-     && curl -skf "https://${PORTAINER_BIND}:9443/api/status" >/dev/null 2>&1; then
-    PORTAINER_OK=1
-    break
+# Docker Hub 连通性预检（仅未配置镜像时）：超时则即时给出指引，而不是等 60 秒后报错
+if [ -z "$REGISTRY_MIRRORS" ]; then
+  if ! curl -m 5 -sI https://registry-1.docker.io/v2/ >/dev/null 2>&1; then
+    warn "Docker Hub 直连超时且未配置 REGISTRY_MIRRORS——镜像拉取预计失败。"
+    warn "建议现在中止，改用: REGISTRY_MIRRORS=\"https://docker.m.daocloud.io\" bash $0 重跑"
+    read -r -t 10 -p "      （10 秒后自动继续部署，失败不影响其余初始化步骤）" _ || true
+    echo ""
   fi
-done
-if [ "$PORTAINER_OK" = "1" ]; then
-  log "Portainer 已就绪。"
+fi
+
+docker rm -f portainer >/dev/null 2>&1 || true
+
+# 部署失败不中止脚本：初始化脚本不应被单一组件的镜像拉取问题卡死，
+# SSH/防火墙/fail2ban/swap 等其余成果照常保留
+PORTAINER_UP=0
+if docker compose -f /opt/portainer/docker-compose.yml up -d; then
+  PORTAINER_UP=1
 else
-  warn "Portainer 未在 30 秒内就绪。请手动检查: docker logs portainer"
+  warn "Portainer 部署失败（通常是 docker.io 拉取被阻断）。脚本继续执行其余步骤，恢复方法："
+  warn "  方法1（预拉取+retag）:"
+  warn "    docker pull docker.m.daocloud.io/portainer/portainer-ce:2.21.4"
+  warn "    docker tag docker.m.daocloud.io/portainer/portainer-ce:2.21.4 portainer/portainer-ce:2.21.4"
+  warn "    cd /opt/portainer && docker compose up -d"
+  warn "  方法2（全局加速后重跑）:"
+  warn "    REGISTRY_MIRRORS=\"https://docker.m.daocloud.io\" ALLOW_NON_FRESH=1 bash $0"
+fi
+
+if [ "$PORTAINER_UP" = "1" ]; then
+  log "等待 Portainer 就绪（最多 30 秒）..."
+  PORTAINER_OK=0
+  for _ in {1..10}; do
+    sleep 3
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^portainer$' \
+       && curl -skf "https://${PORTAINER_BIND}:9443/api/status" >/dev/null 2>&1; then
+      PORTAINER_OK=1
+      break
+    fi
+  done
+  if [ "$PORTAINER_OK" = "1" ]; then
+    log "Portainer 已就绪。"
+  else
+    warn "Portainer 未在 30 秒内就绪。请手动检查: docker logs portainer"
+  fi
 fi
 
 # ==================== Swap ====================
@@ -476,7 +522,7 @@ if [ "$PORTAINER_BIND" != "127.0.0.1" ]; then
   log "安装 DOCKER-USER 端口白名单（systemd 持久化）..."
   cat > /usr/local/sbin/docker-user-guard.sh <<'GUARD_EOF'
 #!/usr/bin/env bash
-# 由 VPS 初始化脚本 v3.6 生成：限制 Docker 发布端口 9443 的来源。
+# 由 VPS 初始化脚本 v3.7 生成：限制 Docker 发布端口 9443 的来源。
 # 更换白名单时：iptables -F DOCKER-USER 后重跑本脚本，或重启 docker-user-guard 服务。
 set -euo pipefail
 ALLOW_IP="${1:-}"
@@ -533,24 +579,32 @@ else
   echo "  未创建新用户，仍可用 root 登录。"
 fi
 echo "  Portainer 用户名: admin"
-if [ "$VOL_NEW" = "1" ]; then
-  echo "  Portainer 初始密码: ${PORTAINER_PASSWORD}"
-  echo "  （已写入 /root/portainer_initial_password.txt，记下后请删除）"
+if [ "$PORTAINER_UP" = "1" ]; then
+  if [ "$PORTAINER_FRESH" = "1" ]; then
+    echo "  Portainer 初始密码: ${PORTAINER_PASSWORD}"
+    echo "  （已写入 /root/portainer_initial_password.txt，记下后请删除）"
+  else
+    echo "  Portainer 密码: 沿用首次部署时设置（本次未改动）。"
+  fi
+  if [ "$PORTAINER_BIND" = "127.0.0.1" ]; then
+    echo "  Portainer 访问（SSH 隧道）:"
+    echo "    ssh -N -p ${DETECTED_SSH_PORT} -L 9443:localhost:9443 ${LOGIN_USER}@<服务器IP>"
+    echo "    然后打开 https://localhost:9443"
+  else
+    echo "  Portainer 公网地址: https://<服务器IP>:9443"
+  fi
 else
-  echo "  Portainer 密码: 沿用首次部署时设置（本次未改动）。"
-fi
-if [ "$PORTAINER_BIND" = "127.0.0.1" ]; then
-  echo "  Portainer 访问（SSH 隧道）:"
-  echo "    ssh -N -p ${DETECTED_SSH_PORT} -L 9443:localhost:9443 ${LOGIN_USER}@<服务器IP>"
-  echo "    然后打开 https://localhost:9443"
-else
-  echo "  Portainer 公网地址: https://<服务器IP>:9443"
+  echo "  Portainer: 未部署成功（其余初始化均已完成），按上方日志中的两种方法恢复。"
 fi
 echo ""
 warn "退出当前会话前，请完成以下检查："
 warn "  1. ufw status verbose  — 确认放行端口正确"
 warn "  2. docker info         — Docker 正常"
-warn "  3. docker ps           — Portainer 运行中"
+if [ "$PORTAINER_UP" = "1" ]; then
+  warn "  3. docker ps           — Portainer 运行中"
+else
+  warn "  3. Portainer 未部署——先按上方方法恢复，再 docker ps 验证"
+fi
 warn "  4. 另开终端用 ${LOGIN_USER} 密钥登录，并执行 sudo -n whoami 验证提权"
 warn "  5. 确认后删除密码文件: rm -f /root/*_initial_password.txt"
 warn "  6. 以后新增登录用户需同步修改 /etc/ssh/sshd_config.d/00-hardening.conf 的 AllowUsers"
