@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-#  VPS 初始化脚本 v3.7（最终版）
+#  VPS 初始化脚本 v3.8（最终版）
 #  仅适用于全新安装的 Ubuntu / Debian 裸机。
 #  运行前请保持另一个 root SSH 会话，以防万一。
 #
@@ -10,6 +10,7 @@ set -euo pipefail
 #    SSH_PUBLIC_KEY="ssh-ed25519 AAAA..." bash vps_init.sh
 #  国内等 docker.io 被阻断的网络，请同时配置镜像加速：
 #    REGISTRY_MIRRORS="https://docker.m.daocloud.io" bash vps_init.sh
+#  （腾讯云内网可用 https://mirror.ccs.tencentyun.com）
 #  无人值守时可直接传 PORTAINER_PASSWORD=...（会留在 shell 历史）；
 #  交互终端会询问密码（回车则自动生成）。
 # =============================================================================
@@ -25,7 +26,7 @@ SWAP_SIZE_MB="${SWAP_SIZE_MB:-2048}"
 TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
 ENABLE_IPV6="${ENABLE_IPV6:-true}"
 ALLOW_NON_FRESH="${ALLOW_NON_FRESH:-0}"
-REGISTRY_MIRRORS="${REGISTRY_MIRRORS:-}"             # Docker Hub 镜像加速，空格分隔多个；国内网络通常必需
+REGISTRY_MIRRORS="${REGISTRY_MIRRORS:-}"             # Docker Hub 镜像加速，空格分隔多个
 
 # ==================== 辅助函数 ====================
 log()  { echo -e "\033[1;32m[+] $*\033[0m"; }
@@ -38,6 +39,17 @@ SSHD_BIN="$(command -v sshd 2>/dev/null || echo /usr/sbin/sshd)"
 # 规范化：docker -p 不接受 "localhost" 作为 host IP
 [ "$PORTAINER_BIND" = "localhost" ] && PORTAINER_BIND="127.0.0.1"
 
+# /run 是 tmpfs，每次开机重建；/run/sshd 由 ssh.service 的 RuntimeDirectory= 或
+# openssh 包的 tmpfiles.d 创建，并会在服务停止时被 systemd 清除。
+# sshd -t/-T 在目录缺失时直接 fatal（"Missing privilege separation directory"）。
+# 关键教训：apt 升级 openssh-server 会重启/停止 ssh 服务、清掉该目录——
+# 所以除了这里，SSH 加固段（apt 之后）必须再次调用本函数。
+ensure_run_sshd() {
+  mkdir -p /run/sshd
+  chmod 0755 /run/sshd
+}
+ensure_run_sshd   # 覆盖稍后 get_ssh_port 的 sshd -T
+
 # ==================== 前置条件检查 ====================
 [ "$(id -u)" -eq 0 ] || err "请用 root 用户运行本脚本。"
 command -v systemctl &>/dev/null || err "未检测到 systemd，无法继续。"
@@ -48,14 +60,6 @@ source /etc/os-release
 
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a   # 避免 needrestart 弹交互菜单
-
-# /run 是 tmpfs，每次开机重建；/run/sshd 由 ssh.service 的 RuntimeDirectory=
-# 或 openssh 包的 tmpfiles.d 在开机/服务启动时创建。若 sshd 此刻并非由 systemd
-# 单元维持运行（控制台操作、LXC 容器、openssh 升级中间态等），该目录会缺失，
-# 导致 sshd -t/-T 直接报 "Missing privilege separation directory: /run/sshd"。
-# 提前创建（与 Debian 官方 postinst 做法一致），保证后续所有 sshd 检测可靠。
-mkdir -p /run/sshd
-chmod 0755 /run/sshd
 
 # ---- 裸机检测 ----
 WARN_COUNT=0
@@ -85,7 +89,6 @@ fi
 # ==================== SSH 端口检测（不修改 sshd，仅用于 UFW/提示） ====================
 get_ssh_port() {
   local out port
-  # 失败时显式告警，不再静默回退（warn 已走 stderr，不会污染本函数的 stdout 捕获）
   if ! out="$("$SSHD_BIN" -T 2>&1)"; then
     warn "sshd -T 读取失败: ${out}——端口检测回退为 22"
     echo "22"
@@ -167,6 +170,10 @@ EOF
   grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config.d' /etc/ssh/sshd_config \
     || sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
 
+  # 关键修复：上面 apt-get upgrade 刚升级过 openssh-server，升级重启/停止 ssh 服务时
+  # RuntimeDirectory=sshd 被 systemd 清除，必须在这里重建，否则后续 sshd 检测全部 fatal
+  ensure_run_sshd
+
   # 逐项探测本机 sshd 是否支持指令，避免整个 drop-in 因单条指令失效
   # （OpenSSH 8.2 不认 KbdInteractiveAuthentication，新版本可能移除 ChallengeResponseAuthentication）
   mapfile -t SSH_OPTS <<'OPTS'
@@ -190,7 +197,7 @@ OPTS
   # 00- 前缀保证本文件按字典序最先读取，先于 50-cloud-init.conf 生效。
   # 切勿改成 99- 等更大序号，否则加固会被 cloud-init 静默覆盖！
   {
-    echo "# 由 VPS 初始化脚本 v3.7 生成。"
+    echo "# 由 VPS 初始化脚本 v3.8 生成。"
     echo "# sshd 首次出现的值生效；00- 前缀保证先于 50-cloud-init.conf 读取。"
     for opt in "${SSH_OPTS[@]}"; do
       echo "$opt"
@@ -198,22 +205,31 @@ OPTS
   } > /etc/ssh/sshd_config.d/00-hardening.conf
   chmod 644 /etc/ssh/sshd_config.d/00-hardening.conf
 
-  # 校验失败时输出 sshd 的真实报错，而不是笼统指向配置文件
-  if SSHD_T_OUT="$("$SSHD_BIN" -t 2>&1)"; then
-    if ! systemctl restart sshd 2>/dev/null && ! systemctl restart ssh 2>/dev/null; then
-      err "SSH 重启失败（此时 UFW 尚未启用，当前会话不受影响）。请手动排查后重跑。"
+  if [ -n "$REGULAR_USERS" ]; then
+    warn "AllowUsers 仅含 root 和 ${NEW_USER}；以下已有用户加固后将无法 SSH 登录：${REGULAR_USERS}"
+    warn "如需保留，请把用户名加入 /etc/ssh/sshd_config.d/00-hardening.conf 的 AllowUsers 行"
+  fi
+
+  # 校验失败时输出 sshd 的真实报错；若失败是 /run/sshd 再次丢失，先重建再重试一次
+  if ! SSHD_T_OUT="$("$SSHD_BIN" -t 2>&1)"; then
+    ensure_run_sshd
+    if ! SSHD_T_OUT="$("$SSHD_BIN" -t 2>&1)"; then
+      err "sshd -t 校验失败: ${SSHD_T_OUT:-未知错误}。请检查 /etc/ssh/sshd_config.d/00-hardening.conf 与 sshd 主配置。"
     fi
-    log "SSH 已重启，生效参数核对（sshd -T）："
-    "$SSHD_BIN" -T 2>/dev/null \
-      | grep -Ei '^(passwordauthentication|permitrootlogin|kbdinteractiveauthentication|challengeresponseauthentication|allowusers) ' \
-      | sed 's/^/      /'
-    # 断言：防止加固被其他文件覆盖后静默失效
-    EFFECTIVE_PA="$("$SSHD_BIN" -T 2>/dev/null | awk '/^passwordauthentication /{print $2; exit}')"
-    if [ "$EFFECTIVE_PA" = "yes" ]; then
-      warn "危险：PasswordAuthentication 实际仍为 yes（被其他配置覆盖），请立即检查 /etc/ssh/sshd_config.d/ 与主配置！"
-    fi
-  else
-    err "sshd -t 校验失败: ${SSHD_T_OUT:-未知错误}。请检查 /etc/ssh/sshd_config.d/00-hardening.conf 与 sshd 主配置。"
+    log "sshd -t 首次失败（目录竞态），重建 /run/sshd 后重试通过。"
+  fi
+
+  if ! systemctl restart sshd 2>/dev/null && ! systemctl restart ssh 2>/dev/null; then
+    err "SSH 重启失败（此时 UFW 尚未启用，当前会话不受影响）。请手动排查后重跑。"
+  fi
+  log "SSH 已重启，生效参数核对（sshd -T）："
+  "$SSHD_BIN" -T 2>/dev/null \
+    | grep -Ei '^(passwordauthentication|permitrootlogin|kbdinteractiveauthentication|challengeresponseauthentication|allowusers) ' \
+    | sed 's/^/      /'
+  # 断言：防止加固被其他文件覆盖后静默失效
+  EFFECTIVE_PA="$("$SSHD_BIN" -T 2>/dev/null | awk '/^passwordauthentication /{print $2; exit}')"
+  if [ "$EFFECTIVE_PA" = "yes" ]; then
+    warn "危险：PasswordAuthentication 实际仍为 yes（被其他配置覆盖），请立即检查 /etc/ssh/sshd_config.d/ 与主配置！"
   fi
 else
   log "未提供 SSH_PUBLIC_KEY，跳过用户创建与 SSH 加固（避免被锁在系统外）。"
@@ -315,9 +331,7 @@ fi
 log "部署 Portainer CE..."
 mkdir -p /opt/portainer
 
-# 幂等：数据卷存在且密码 hash 文件在 → 视为已部署，沿用旧密码；否则重新初始化。
-# （卷存在但 hash 缺失时重新生成也无害：Portainer 对已初始化的管理员会忽略 --admin-password-file；
-#   反过来，"卷已建但容器从未启动过"的失败重试也能重新拿到密码初始化机会）
+# 幂等：数据卷存在且密码 hash 文件在 → 视为已部署，沿用旧密码；否则重新初始化
 PORTAINER_FRESH=1
 if docker volume inspect portainer_data &>/dev/null && [ -f /root/portainer_admin_password_hash ]; then
   PORTAINER_FRESH=0
@@ -339,9 +353,8 @@ if [ "$PORTAINER_FRESH" = "1" ]; then
   chmod 600 /root/portainer_admin_password_hash /root/portainer_initial_password.txt
 fi
 
-# 注意：卷已存在时 --admin-password-file 不会生效（安装被跳过），
-# 且若密码 hash 文件已被删除，挂载不存在的 bind 路径会让 Docker 创建同名目录导致容器异常。
-# 因此两种情况使用不同的 compose 文件。
+# 卷已存在时 --admin-password-file 不会生效，且挂载不存在的 bind 路径会让 Docker
+# 创建同名目录导致容器异常，因此两种情况使用不同的 compose 文件。
 if [ "$PORTAINER_FRESH" = "1" ]; then
   cat > /opt/portainer/docker-compose.yml <<COMPOSE_EOF
 services:
@@ -384,7 +397,7 @@ volumes:
 COMPOSE_EOF
 fi
 
-# Docker Hub 连通性预检（仅未配置镜像时）：超时则即时给出指引，而不是等 60 秒后报错
+# Docker Hub 连通性预检（仅未配置镜像时）
 if [ -z "$REGISTRY_MIRRORS" ]; then
   if ! curl -m 5 -sI https://registry-1.docker.io/v2/ >/dev/null 2>&1; then
     warn "Docker Hub 直连超时且未配置 REGISTRY_MIRRORS——镜像拉取预计失败。"
@@ -396,8 +409,7 @@ fi
 
 docker rm -f portainer >/dev/null 2>&1 || true
 
-# 部署失败不中止脚本：初始化脚本不应被单一组件的镜像拉取问题卡死，
-# SSH/防火墙/fail2ban/swap 等其余成果照常保留
+# 部署失败不中止脚本：初始化脚本不应被单一组件的镜像拉取问题卡死
 PORTAINER_UP=0
 if docker compose -f /opt/portainer/docker-compose.yml up -d; then
   PORTAINER_UP=1
@@ -449,7 +461,6 @@ else
       mkswap /swapfile
       swapon /swapfile
     else
-      # 文件已存在但未启用（例如 fstab 被清过），直接重新挂上
       mkswap /swapfile
       swapon /swapfile
     fi
@@ -503,7 +514,6 @@ log "配置 UFW 防火墙..."
 ufw default deny incoming
 ufw default allow outgoing
 
-# limit 自带 6 连接/30 秒限速；与实际端口不一致时两个都放行，防止锁死
 ufw limit "${SSH_PORT}/tcp" comment 'SSH' >/dev/null
 if [ "$DETECTED_SSH_PORT" != "$SSH_PORT" ]; then
   ufw limit "${DETECTED_SSH_PORT}/tcp" comment 'SSH (detected)' >/dev/null
@@ -522,7 +532,7 @@ if [ "$PORTAINER_BIND" != "127.0.0.1" ]; then
   log "安装 DOCKER-USER 端口白名单（systemd 持久化）..."
   cat > /usr/local/sbin/docker-user-guard.sh <<'GUARD_EOF'
 #!/usr/bin/env bash
-# 由 VPS 初始化脚本 v3.7 生成：限制 Docker 发布端口 9443 的来源。
+# 由 VPS 初始化脚本 v3.8 生成：限制 Docker 发布端口 9443 的来源。
 # 更换白名单时：iptables -F DOCKER-USER 后重跑本脚本，或重启 docker-user-guard 服务。
 set -euo pipefail
 ALLOW_IP="${1:-}"
