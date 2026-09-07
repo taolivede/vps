@@ -2,12 +2,14 @@
 set -euo pipefail
 
 # =============================================================================
-#  VPS 初始化脚本 v3.8（最终版）
+#  VPS 初始化脚本 v3.9（最终版）
 #  仅适用于全新安装的 Ubuntu / Debian 裸机。
 #  运行前请保持另一个 root SSH 会话，以防万一。
 #
 #  用法：
 #    SSH_PUBLIC_KEY="ssh-ed25519 AAAA..." bash vps_init.sh
+#  需保留云镜像自带用户（如 ubuntu/lighthouse）的 SSH 登录时：
+#    EXTRA_SSH_USERS="ubuntu lighthouse" bash vps_init.sh
 #  国内等 docker.io 被阻断的网络，请同时配置镜像加速：
 #    REGISTRY_MIRRORS="https://docker.m.daocloud.io" bash vps_init.sh
 #  （腾讯云内网可用 https://mirror.ccs.tencentyun.com）
@@ -19,6 +21,7 @@ set -euo pipefail
 NEW_USER="${NEW_USER:-deploy}"
 SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY:-}"
 SSH_PORT="${SSH_PORT:-22}"
+EXTRA_SSH_USERS="${EXTRA_SSH_USERS:-}"               # 额外允许 SSH 的已有用户，空格分隔（如 "ubuntu lighthouse"）
 PORTAINER_PASSWORD="${PORTAINER_PASSWORD:-}"
 PORTAINER_BIND="${PORTAINER_BIND:-127.0.0.1}"        # 强烈建议保持 127.0.0.1
 UFW_ALLOW_PORTAINER_IP="${UFW_ALLOW_PORTAINER_IP:-}" # 公网绑定时来源白名单（可选）
@@ -121,6 +124,7 @@ timedatectl set-timezone "$TIMEZONE" 2>/dev/null || warn "时区设置失败，�
 # ==================== 用户与 SSH 安全 ====================
 LOGIN_USER="root"
 SUDO_PASS_NOTE=""
+ALLOW_SSH_USERS="root"
 
 if [ -n "$SSH_PUBLIC_KEY" ]; then
   log "创建/配置用户 ${NEW_USER} 并写入 SSH 公钥..."
@@ -137,6 +141,7 @@ if [ -n "$SSH_PUBLIC_KEY" ]; then
   fi
   usermod -aG sudo "$NEW_USER" || true
   LOGIN_USER="$NEW_USER"
+  ALLOW_SSH_USERS="root ${NEW_USER}"
 
   # 免密 sudo（写入后立刻校验，失败则移除，用户仍可用密码 sudo）
   cat > "/etc/sudoers.d/90-${NEW_USER}" <<EOF
@@ -191,24 +196,28 @@ OPTS
   if "$SSHD_BIN" -t -o "KbdInteractiveAuthentication=no" 2>/dev/null; then
     SSH_OPTS+=("KbdInteractiveAuthentication no")
   fi
-  SSH_OPTS+=("AllowUsers root ${NEW_USER}")
+
+  if [ -n "$EXTRA_SSH_USERS" ]; then
+    ALLOW_SSH_USERS+=" ${EXTRA_SSH_USERS}"
+  fi
+  SSH_OPTS+=("AllowUsers ${ALLOW_SSH_USERS}")
+
+  if [ -n "$REGULAR_USERS" ] && [ -z "$EXTRA_SSH_USERS" ]; then
+    warn "AllowUsers 仅含 root 和 ${NEW_USER}；以下已有用户加固后将无法 SSH 登录：${REGULAR_USERS}"
+    warn "如需保留，设置 EXTRA_SSH_USERS=\"<用户名 空格分隔>\" 重跑，或手动编辑 00-hardening.conf 后 systemctl restart ssh"
+  fi
 
   # 关键：sshd 对大多数指令取『首次出现的值』。
   # 00- 前缀保证本文件按字典序最先读取，先于 50-cloud-init.conf 生效。
   # 切勿改成 99- 等更大序号，否则加固会被 cloud-init 静默覆盖！
   {
-    echo "# 由 VPS 初始化脚本 v3.8 生成。"
+    echo "# 由 VPS 初始化脚本 v3.9 生成。"
     echo "# sshd 首次出现的值生效；00- 前缀保证先于 50-cloud-init.conf 读取。"
     for opt in "${SSH_OPTS[@]}"; do
       echo "$opt"
     done
   } > /etc/ssh/sshd_config.d/00-hardening.conf
   chmod 644 /etc/ssh/sshd_config.d/00-hardening.conf
-
-  if [ -n "$REGULAR_USERS" ]; then
-    warn "AllowUsers 仅含 root 和 ${NEW_USER}；以下已有用户加固后将无法 SSH 登录：${REGULAR_USERS}"
-    warn "如需保留，请把用户名加入 /etc/ssh/sshd_config.d/00-hardening.conf 的 AllowUsers 行"
-  fi
 
   # 校验失败时输出 sshd 的真实报错；若失败是 /run/sshd 再次丢失，先重建再重试一次
   if ! SSHD_T_OUT="$("$SSHD_BIN" -t 2>&1)"; then
@@ -222,14 +231,21 @@ OPTS
   if ! systemctl restart sshd 2>/dev/null && ! systemctl restart ssh 2>/dev/null; then
     err "SSH 重启失败（此时 UFW 尚未启用，当前会话不受影响）。请手动排查后重跑。"
   fi
+
+  # 生效值核对与断言：一次性读入变量后再解析。
+  # 教训：『管道 + awk 提前 exit』会让上游 sshd -T 收到 SIGPIPE(退出码 141)，
+  # 在 pipefail 下整条赋值失败、set -e 误杀脚本——变量没有管道写端，无此问题。
+  if ! SSHD_T_EFF="$("$SSHD_BIN" -T 2>&1)"; then
+    ensure_run_sshd
+    SSHD_T_EFF="$("$SSHD_BIN" -T 2>&1)" || err "sshd -T 读取失败: ${SSHD_T_EFF:-未知错误}"
+  fi
   log "SSH 已重启，生效参数核对（sshd -T）："
-  "$SSHD_BIN" -T 2>/dev/null \
-    | grep -Ei '^(passwordauthentication|permitrootlogin|kbdinteractiveauthentication|challengeresponseauthentication|allowusers) ' \
-    | sed 's/^/      /'
-  # 断言：防止加固被其他文件覆盖后静默失效
-  EFFECTIVE_PA="$("$SSHD_BIN" -T 2>/dev/null | awk '/^passwordauthentication /{print $2; exit}')"
+  awk '/^(passwordauthentication|permitrootlogin|kbdinteractiveauthentication|challengeresponseauthentication|allowusers) /{printf "      %s\n", $0}' <<<"$SSHD_T_EFF"
+  EFFECTIVE_PA="$(awk '/^passwordauthentication /{print $2; exit}' <<<"$SSHD_T_EFF")"
   if [ "$EFFECTIVE_PA" = "yes" ]; then
     warn "危险：PasswordAuthentication 实际仍为 yes（被其他配置覆盖），请立即检查 /etc/ssh/sshd_config.d/ 与主配置！"
+  elif [ -z "$EFFECTIVE_PA" ]; then
+    warn "无法从 sshd -T 解析 PasswordAuthentication，请人工核对: sshd -T | grep -i passwordauth"
   fi
 else
   log "未提供 SSH_PUBLIC_KEY，跳过用户创建与 SSH 加固（避免被锁在系统外）。"
@@ -428,7 +444,8 @@ if [ "$PORTAINER_UP" = "1" ]; then
   PORTAINER_OK=0
   for _ in {1..10}; do
     sleep 3
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^portainer$' \
+    # 不用 grep -q：避免 docker ps 因下游提前退出收到 SIGPIPE 造成误判
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep '^portainer$' >/dev/null \
        && curl -skf "https://${PORTAINER_BIND}:9443/api/status" >/dev/null 2>&1; then
       PORTAINER_OK=1
       break
@@ -461,6 +478,7 @@ else
       mkswap /swapfile
       swapon /swapfile
     else
+      # 文件已存在但未启用（例如 fstab 被清过），直接重新挂上
       mkswap /swapfile
       swapon /swapfile
     fi
@@ -532,7 +550,7 @@ if [ "$PORTAINER_BIND" != "127.0.0.1" ]; then
   log "安装 DOCKER-USER 端口白名单（systemd 持久化）..."
   cat > /usr/local/sbin/docker-user-guard.sh <<'GUARD_EOF'
 #!/usr/bin/env bash
-# 由 VPS 初始化脚本 v3.8 生成：限制 Docker 发布端口 9443 的来源。
+# 由 VPS 初始化脚本 v3.9 生成：限制 Docker 发布端口 9443 的来源。
 # 更换白名单时：iptables -F DOCKER-USER 后重跑本脚本，或重启 docker-user-guard 服务。
 set -euo pipefail
 ALLOW_IP="${1:-}"
@@ -576,6 +594,7 @@ log "初始化完成"
 echo "=============================================="
 if [ -n "$SSH_PUBLIC_KEY" ]; then
   echo "  登录用户: ${LOGIN_USER}"
+  echo "  SSH 允许登录的用户: ${ALLOW_SSH_USERS}"
   if [ "$DETECTED_SSH_PORT" != "$SSH_PORT" ]; then
     echo "  SSH 端口: sshd=${DETECTED_SSH_PORT}；UFW 已放行 ${SSH_PORT} 和 ${DETECTED_SSH_PORT}（请核对后清理）"
   else
@@ -617,7 +636,7 @@ else
 fi
 warn "  4. 另开终端用 ${LOGIN_USER} 密钥登录，并执行 sudo -n whoami 验证提权"
 warn "  5. 确认后删除密码文件: rm -f /root/*_initial_password.txt"
-warn "  6. 以后新增登录用户需同步修改 /etc/ssh/sshd_config.d/00-hardening.conf 的 AllowUsers"
+warn "  6. 增删 SSH 登录用户：改 EXTRA_SSH_USERS 重跑，或编辑 00-hardening.conf 的 AllowUsers 后 systemctl restart ssh"
 if [ -f /run/reboot-required ]; then
   warn "  7. 系统提示需要重启，验证 SSH 可登录后执行 reboot"
 fi
